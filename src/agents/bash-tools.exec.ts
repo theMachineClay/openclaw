@@ -26,6 +26,7 @@ import {
 } from "../infra/shell-env.js";
 import { logInfo } from "../logger.js";
 import { parseAgentSessionKey, resolveAgentIdFromSessionKey } from "../routing/session-key.js";
+import type { MaskedSecrets } from "../security/masked-secrets/index.js";
 import { markBackgrounded, tail } from "./bash-process-registry.js";
 import {
   DEFAULT_APPROVAL_REQUEST_TIMEOUT_MS,
@@ -83,6 +84,7 @@ export type ExecToolDefaults = {
   notifyOnExit?: boolean;
   notifyOnExitEmptySuccess?: boolean;
   cwd?: string;
+  maskedSecrets?: MaskedSecrets;
 };
 
 export type { BashSandboxConfig } from "./bash-tools.shared.js";
@@ -972,8 +974,21 @@ export function createExecTool(
       // before we execute and burn tokens in cron loops.
       await validateScriptFileForShellBleed({ command: params.command, workdir });
 
+      // Masked secrets preflight: block dangerous commands and substitute {{secret:NAME}} refs.
+      const maskedSecrets = defaults?.maskedSecrets;
+      let maskedCommand = params.command;
+      if (maskedSecrets) {
+        const preflightResult = maskedSecrets.preflight(params.command);
+        if (!preflightResult.allowed) {
+          throw new Error(`exec blocked by secret protection: ${preflightResult.reason}`);
+        }
+        if (preflightResult.processedCommand) {
+          maskedCommand = preflightResult.processedCommand;
+        }
+      }
+
       const run = await runExecProcess({
-        command: params.command,
+        command: maskedCommand,
         execCommand: execCommandOverride,
         workdir,
         env,
@@ -1068,18 +1083,21 @@ export function createExecTool(
               reject(new Error(outcome.reason ?? "Command failed."));
               return;
             }
+            // Redact leaked secrets from output before returning to agent.
+            const rawOutput = outcome.aggregated || "(no output)";
+            const safeOutput = maskedSecrets ? maskedSecrets.redact(rawOutput).text : rawOutput;
             resolve({
               content: [
                 {
                   type: "text",
-                  text: `${getWarningText()}${outcome.aggregated || "(no output)"}`,
+                  text: `${getWarningText()}${safeOutput}`,
                 },
               ],
               details: {
                 status: "completed",
                 exitCode: outcome.exitCode ?? 0,
                 durationMs: outcome.durationMs,
-                aggregated: outcome.aggregated,
+                aggregated: safeOutput,
                 cwd: run.session.cwd,
               },
             });
